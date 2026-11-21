@@ -1,0 +1,11 @@
+packages:
+  - web
+  - worker
+minimumReleaseAgeExclude:
+  - "@cloudflare/workers-utils@0.56.0"
+  - miniflare@5.20261119.0-beta
+  - wrangler@4.166.0
+allowBuilds:
+  "@tsc-rs/typescript": true
+  esbuild: true
+  workerd: true

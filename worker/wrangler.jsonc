@@ -1,0 +1,113 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "knowledgetrackr",
+  "account_id": "8c92aeb506c8529d877db4d6da6657dd",
+  "main": "build/worker/shim.mjs",
+  "compatibility_date": "2026-11-21",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": false,
+  "observability": {
+    "enabled": true,
+    "traces": {
+      "enabled": true,
+    },
+  },
+  "build": {
+    "command": "worker-build --release",
+  },
+  "vars": {
+    "APP_ORIGIN": "http://localhost:5173",
+    "RP_ID": "localhost",
+    "RP_NAME": "KnowledgeTrackr",
+    "MAIL_FROM": "noreply@knowledgetrackr.com",
+    "COOKIE_SECURE": "false",
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "knowledgetrackr-local",
+      "database_id": "00000000-0000-4000-8000-000000000001",
+      "migrations_dir": "migrations",
+    },
+  ],
+  "r2_buckets": [
+    {
+      "binding": "FILES",
+      "bucket_name": "knowledgetrackr-local",
+    },
+  ],
+  "send_email": [
+    {
+      "name": "EMAIL",
+    },
+  ],
+  "triggers": {
+    "crons": ["15 * * * *"],
+  },
+  "env": {
+    "staging": {
+      "name": "knowledgetrackr-staging",
+      "vars": {
+        "APP_ORIGIN": "https://staging.knowledgetrackr.com",
+        "RP_ID": "staging.knowledgetrackr.com",
+        "RP_NAME": "KnowledgeTrackr",
+        "MAIL_FROM": "noreply@knowledgetrackr.com",
+        "COOKIE_SECURE": "true",
+      },
+      "d1_databases": [
+        {
+          "binding": "DB",
+          "database_name": "knowledgetrackr-staging",
+          "database_id": "413c4511-07ef-4ffe-afeb-0fdb12b3bf58",
+          "migrations_dir": "migrations",
+        },
+      ],
+      "r2_buckets": [
+        {
+          "binding": "FILES",
+          "bucket_name": "knowledgetrackr-staging",
+        },
+      ],
+      "send_email": [
+        {
+          "name": "EMAIL",
+        },
+      ],
+      "triggers": {
+        "crons": ["15 * * * *"],
+      },
+    },
+    "production": {
+      "name": "knowledgetrackr",
+      "vars": {
+        "APP_ORIGIN": "https://knowledgetrackr.com",
+        "RP_ID": "knowledgetrackr.com",
+        "RP_NAME": "KnowledgeTrackr",
+        "MAIL_FROM": "noreply@knowledgetrackr.com",
+        "COOKIE_SECURE": "true",
+      },
+      "d1_databases": [
+        {
+          "binding": "DB",
+          "database_name": "knowledgetrackr",
+          "database_id": "22a69b4e-f65b-4858-8110-2ad65ad73ff9",
+          "migrations_dir": "migrations",
+        },
+      ],
+      "r2_buckets": [
+        {
+          "binding": "FILES",
+          "bucket_name": "knowledgetrackr",
+        },
+      ],
+      "send_email": [
+        {
+          "name": "EMAIL",
+        },
+      ],
+      "triggers": {
+        "crons": ["15 * * * *"],
+      },
+    },
+  },
+}

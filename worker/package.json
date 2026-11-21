@@ -1,0 +1,11 @@
+{
+  "name": "knowledgetrackr-worker",
+  "private": true,
+  "scripts": {
+    "dev": "wrangler dev --ip 127.0.0.1",
+    "migrate": "wrangler d1 migrations apply knowledgetrackr-local --local"
+  },
+  "devDependencies": {
+    "wrangler": "4.166.0"
+  }
+}

@@ -1,0 +1,26 @@
+# The public repository is source, tests, lockfiles, and config.
+# Standards and other Markdown stay on the machine (OVR-002).
+*.md
+docs/
+
+# Secrets and local environment (GIT-09)
+.env*
+!.env.example
+.dev.vars
+*.local
+credentials.json
+*.pem
+
+# Editor
+.cursor/
+
+# Build and tool output
+node_modules/
+dist/
+build/
+target/
+.wrangler/
+.cargo/
+coverage/
+playwright-report/
+test-results/

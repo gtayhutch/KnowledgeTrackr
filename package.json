@@ -1,0 +1,20 @@
+{
+  "name": "knowledgetrackr",
+  "private": true,
+  "scripts": {
+    "dev": "concurrently -k -n web,api \"pnpm --dir web dev\" \"node scripts/cargo.mjs pnpm --dir worker exec wrangler dev\"",
+    "format": "node scripts/cargo.mjs cargo fmt --manifest-path worker/Cargo.toml && pnpm exec prettier --write \"web/**/*.{ts,tsx,css}\" \"package.json\" \"web/package.json\" \"worker/package.json\" \"worker/wrangler.jsonc\"",
+    "format:check": "node scripts/cargo.mjs cargo fmt --manifest-path worker/Cargo.toml --check && pnpm exec prettier --check \"web/**/*.{ts,tsx,css}\" \"package.json\" \"web/package.json\" \"worker/package.json\" \"worker/wrangler.jsonc\"",
+    "lint": "node scripts/cargo.mjs cargo clippy --manifest-path worker/Cargo.toml --tests -- -D warnings && node scripts/cargo.mjs cargo clippy --manifest-path worker/Cargo.toml --target wasm32-unknown-unknown -- -D warnings",
+    "typecheck": "tsc -p web/tsconfig.json --noEmit",
+    "test": "node scripts/cargo.mjs cargo test --manifest-path worker/Cargo.toml && pnpm --dir web test",
+    "test:access": "node scripts/cargo.mjs cargo test --manifest-path worker/Cargo.toml authz",
+    "test:e2e": "pnpm --dir web exec playwright test",
+    "verify": "pnpm run format:check && pnpm run lint && pnpm run typecheck && pnpm test && pnpm run test:e2e"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1",
+    "prettier": "^3.6.2",
+    "typescript": "npm:@tsc-rs/typescript@0.8.0"
+  }
+}
