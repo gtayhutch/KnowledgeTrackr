@@ -16,9 +16,10 @@ use crate::limits::{
 use crate::search_query::fts_match;
 use crate::store::{self, PasskeyRow};
 use crate::validate::{
-    decode_b64, require_article, require_display_name, require_email, require_label,
-    require_upload, ArticleWrite, CeremonyBody, CompanyName, EmailLink, EmailStart, NewCompany,
-    NewMember,
+    decode_b64, require_description, require_display_name, require_email, require_label,
+    require_page_content, require_position, require_slug, require_upload, slug_from_name,
+    ArticleMove, ArticleWrite, CeremonyBody, CompanyName, EmailLink, EmailStart, NewCompany,
+    NewMember, SpaceWrite,
 };
 use crate::webauthn::{
     challenge_expiry, new_challenge, verify_authentication, verify_registration, CeremonyResponse,
@@ -79,6 +80,21 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         .post_async("/api/companies", create_company)
         .patch_async("/api/companies/:company_id", rename_company)
         .post_async("/api/companies/:company_id/members", add_member)
+        .get_async(
+            "/api/companies/:company_id/mention-targets",
+            mention_targets,
+        )
+        .get_async("/api/companies/:company_id/spaces", list_spaces)
+        .post_async("/api/companies/:company_id/spaces", create_space)
+        .patch_async("/api/companies/:company_id/spaces/:space_id", rename_space)
+        .post_async(
+            "/api/companies/:company_id/spaces/:space_id/archive",
+            archive_space,
+        )
+        .post_async(
+            "/api/companies/:company_id/spaces/:space_id/restore",
+            restore_space,
+        )
         .get_async("/api/companies/:company_id/articles", list_articles)
         .post_async("/api/companies/:company_id/articles", create_article)
         .get_async(
@@ -88,6 +104,10 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         .put_async(
             "/api/companies/:company_id/articles/:article_id",
             update_article,
+        )
+        .post_async(
+            "/api/companies/:company_id/articles/:article_id/move",
+            move_article,
         )
         .delete_async(
             "/api/companies/:company_id/articles/:article_id",
@@ -381,9 +401,126 @@ async fn create_company(mut req: Request, ctx: RouteContext<AppConfig>) -> Resul
         return fail(401, "UNAUTHORIZED", "Sign in again.", None);
     };
     let company_id = random_token();
-    store::create_company(&db, &company_id, &user_id, &name, now_ms()).await?;
+    let space_id = random_token();
+    store::create_company(&db, &company_id, &user_id, &name, &space_id, now_ms()).await?;
     console_log!("{}", json!({"event": "company_created", "userId": user_id}));
-    Response::from_json(&json!({"ok": true, "data": {"id": company_id, "name": name}}))
+    Response::from_json(&json!({
+        "ok": true,
+        "data": {
+            "id": company_id,
+            "name": name,
+            "defaultSpaceId": space_id
+        }
+    }))
+}
+
+async fn list_spaces(req: Request, ctx: RouteContext<AppConfig>) -> Result<Response> {
+    let company_id = param(&ctx, "company_id")?;
+    let db = ctx.env.d1("DB")?;
+    match access(&req, &db, &company_id, Action::ReadArticle).await? {
+        Access::Allow(_) => {}
+        Access::Deny(response) => return Ok(response),
+    }
+    let rows = store::list_spaces(&db, &company_id).await?;
+    let data: Vec<Value> = rows
+        .iter()
+        .map(|row| {
+            json!({
+                "id": row.id,
+                "name": row.name,
+                "slug": row.slug,
+                "description": row.description
+            })
+        })
+        .collect();
+    Response::from_json(&json!({"ok": true, "data": data}))
+}
+
+async fn create_space(mut req: Request, ctx: RouteContext<AppConfig>) -> Result<Response> {
+    let company_id = param(&ctx, "company_id")?;
+    let body: SpaceWrite = read_body!(req);
+    let name = form!(require_label("name", &body.name, 80));
+    let description = form!(require_description(
+        body.description.as_deref().unwrap_or("")
+    ));
+    let slug = match body.slug.as_deref() {
+        Some(value) => form!(require_slug("slug", value)),
+        None => form!(require_slug("slug", &slug_from_name(&name))),
+    };
+    let db = ctx.env.d1("DB")?;
+    match access(&req, &db, &company_id, Action::WriteArticle).await? {
+        Access::Allow(_) => {}
+        Access::Deny(response) => return Ok(response),
+    }
+    let id = random_token();
+    if store::insert_space(&db, &id, &company_id, &name, &slug, &description, now_ms())
+        .await
+        .is_err()
+    {
+        return fail(
+            409,
+            "CONFLICT",
+            "A space with that slug already exists.",
+            Some("slug"),
+        );
+    }
+    Response::from_json(&json!({"ok": true, "data": {"id": id, "slug": slug}}))
+}
+
+async fn rename_space(mut req: Request, ctx: RouteContext<AppConfig>) -> Result<Response> {
+    let company_id = param(&ctx, "company_id")?;
+    let space_id = param(&ctx, "space_id")?;
+    let body: SpaceWrite = read_body!(req);
+    let name = form!(require_label("name", &body.name, 80));
+    let db = ctx.env.d1("DB")?;
+    match access(&req, &db, &company_id, Action::WriteArticle).await? {
+        Access::Allow(_) => {}
+        Access::Deny(response) => return Ok(response),
+    }
+    if store::get_space(&db, &company_id, &space_id)
+        .await?
+        .is_none()
+    {
+        return fail(404, "NOT_FOUND", "That space is not available.", None);
+    }
+    store::rename_space(&db, &company_id, &space_id, &name).await?;
+    Response::from_json(&json!({"ok": true}))
+}
+
+async fn archive_space(req: Request, ctx: RouteContext<AppConfig>) -> Result<Response> {
+    let company_id = param(&ctx, "company_id")?;
+    let space_id = param(&ctx, "space_id")?;
+    let db = ctx.env.d1("DB")?;
+    match access(&req, &db, &company_id, Action::WriteArticle).await? {
+        Access::Allow(_) => {}
+        Access::Deny(response) => return Ok(response),
+    }
+    if store::get_space(&db, &company_id, &space_id)
+        .await?
+        .is_none()
+    {
+        return fail(404, "NOT_FOUND", "That space is not available.", None);
+    }
+    store::archive_space(&db, &company_id, &space_id, now_ms()).await?;
+    Response::from_json(&json!({"ok": true}))
+}
+
+async fn restore_space(req: Request, ctx: RouteContext<AppConfig>) -> Result<Response> {
+    let company_id = param(&ctx, "company_id")?;
+    let space_id = param(&ctx, "space_id")?;
+    let db = ctx.env.d1("DB")?;
+    match access(&req, &db, &company_id, Action::WriteArticle).await? {
+        Access::Allow(_) => {}
+        Access::Deny(response) => return Ok(response),
+    }
+    if store::get_space(&db, &company_id, &space_id)
+        .await?
+        .is_none()
+    {
+        return fail(404, "NOT_FOUND", "That space is not available.", None);
+    }
+    store::restore_space(&db, &company_id, &space_id).await?;
+    Response::from_json(&json!({"ok": true}))
 }
 
 async fn rename_company(mut req: Request, ctx: RouteContext<AppConfig>) -> Result<Response> {
@@ -437,54 +574,144 @@ async fn add_member(mut req: Request, ctx: RouteContext<AppConfig>) -> Result<Re
 
 async fn list_articles(req: Request, ctx: RouteContext<AppConfig>) -> Result<Response> {
     let company_id = param(&ctx, "company_id")?;
-    let query = req
-        .url()?
-        .query_pairs()
-        .find(|(key, _)| key == "q")
-        .map(|(_, value)| value.into_owned())
-        .unwrap_or_default();
+    let url = req.url()?;
+    let mut query = String::new();
+    let mut space_id: Option<String> = None;
+    for (key, value) in url.query_pairs() {
+        match key.as_ref() {
+            "q" => query = value.into_owned(),
+            "spaceId" => space_id = Some(value.into_owned()),
+            _ => {}
+        }
+    }
     let db = ctx.env.d1("DB")?;
     match access(&req, &db, &company_id, Action::ReadArticle).await? {
         Access::Allow(_) => {}
         Access::Deny(response) => return Ok(response),
     }
-    let rows = store::list_articles(&db, &company_id, fts_match(&query).as_deref()).await?;
-    let data: Vec<Value> = rows
+    if let Some(ref space_id) = space_id {
+        if store::get_space(&db, &company_id, space_id)
+            .await?
+            .is_none()
+        {
+            return fail(404, "NOT_FOUND", "That space is not available.", None);
+        }
+    }
+    let rows = store::list_articles(
+        &db,
+        &company_id,
+        space_id.as_deref(),
+        fts_match(&query).as_deref(),
+    )
+    .await?;
+    let data: Vec<Value> = rows.iter().map(page_summary_json).collect();
+    Response::from_json(&json!({"ok": true, "data": data}))
+}
+
+async fn mention_targets(req: Request, ctx: RouteContext<AppConfig>) -> Result<Response> {
+    let company_id = param(&ctx, "company_id")?;
+    let url = req.url()?;
+    let space_id = url
+        .query_pairs()
+        .find(|(key, _)| key == "spaceId")
+        .map(|(_, value)| value.into_owned());
+    let db = ctx.env.d1("DB")?;
+    match access(&req, &db, &company_id, Action::ReadArticle).await? {
+        Access::Allow(_) => {}
+        Access::Deny(response) => return Ok(response),
+    }
+    let members = store::list_company_members(&db, &company_id).await?;
+    let pages = store::list_articles(&db, &company_id, space_id.as_deref(), None).await?;
+    let people: Vec<Value> = members
         .iter()
         .map(|row| {
             json!({
                 "id": row.id,
-                "title": row.title,
-                "body": row.body,
-                "authorId": row.author_id,
-                "updatedAt": row.updated_at
+                "label": row.display_name,
+                "email": row.email,
+                "kind": "person"
             })
         })
         .collect();
-    Response::from_json(&json!({"ok": true, "data": data}))
+    let page_targets: Vec<Value> = pages
+        .iter()
+        .map(|row| {
+            json!({
+                "id": row.id,
+                "label": row.title,
+                "spaceId": row.space_id,
+                "kind": "page"
+            })
+        })
+        .collect();
+    Response::from_json(&json!({
+        "ok": true,
+        "data": {
+            "people": people,
+            "pages": page_targets
+        }
+    }))
 }
 
 async fn create_article(mut req: Request, ctx: RouteContext<AppConfig>) -> Result<Response> {
     let company_id = param(&ctx, "company_id")?;
     let body: ArticleWrite = read_body!(req);
-    let (title, article_body) = form!(require_article(&body.title, &body.body));
+    let (title, content_json, article_body) =
+        form!(require_page_content(&body.title, &body.content));
+    let Some(space_id) = body
+        .space_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return fail(400, "INVALID", "Choose a space.", Some("spaceId"));
+    };
+    let parent_id = body
+        .parent_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
     let db = ctx.env.d1("DB")?;
     let user_id = match access(&req, &db, &company_id, Action::WriteArticle).await? {
         Access::Allow(user_id) => user_id,
         Access::Deny(response) => return Ok(response),
     };
+    if store::get_space(&db, &company_id, space_id)
+        .await?
+        .is_none()
+    {
+        return fail(404, "NOT_FOUND", "That space is not available.", None);
+    }
+    if let Some(parent_id) = parent_id {
+        let Some(parent) = store::get_article(&db, &company_id, parent_id).await? else {
+            return fail(404, "NOT_FOUND", "That parent page is not available.", None);
+        };
+        if parent.space_id != space_id {
+            return fail(
+                400,
+                "INVALID",
+                "The parent page must be in the same space.",
+                Some("parentId"),
+            );
+        }
+    }
     let id = random_token();
+    let now = now_ms();
     store::insert_article(
         &db,
         &id,
         &company_id,
+        space_id,
+        parent_id,
+        &id,
         &title,
         &article_body,
+        &content_json,
         &user_id,
-        now_ms(),
+        now,
     )
     .await?;
-    Response::from_json(&json!({"ok": true, "data": {"id": id}}))
+    Response::from_json(&json!({"ok": true, "data": {"id": id, "updatedAt": now}}))
 }
 
 async fn read_article(req: Request, ctx: RouteContext<AppConfig>) -> Result<Response> {
@@ -496,19 +723,25 @@ async fn read_article(req: Request, ctx: RouteContext<AppConfig>) -> Result<Resp
         Access::Deny(response) => return Ok(response),
     }
     let Some(row) = store::get_article(&db, &company_id, &article_id).await? else {
-        return fail(404, "NOT_FOUND", "That article is not available.", None);
+        return fail(404, "NOT_FOUND", "That page is not available.", None);
     };
-    Response::from_json(&json!({"ok": true, "data": {
-        "id": row.id, "title": row.title, "body": row.body,
-        "authorId": row.author_id, "updatedAt": row.updated_at
-    }}))
+    Response::from_json(&json!({"ok": true, "data": page_json(&row)}))
 }
 
 async fn update_article(mut req: Request, ctx: RouteContext<AppConfig>) -> Result<Response> {
     let company_id = param(&ctx, "company_id")?;
     let article_id = param(&ctx, "article_id")?;
     let body: ArticleWrite = read_body!(req);
-    let (title, article_body) = form!(require_article(&body.title, &body.body));
+    let (title, content_json, article_body) =
+        form!(require_page_content(&body.title, &body.content));
+    let Some(expected_updated_at) = body.expected_updated_at else {
+        return fail(
+            400,
+            "INVALID",
+            "Send the last saved time.",
+            Some("expectedUpdatedAt"),
+        );
+    };
     let db = ctx.env.d1("DB")?;
     match access(&req, &db, &company_id, Action::WriteArticle).await? {
         Access::Allow(_) => {}
@@ -518,14 +751,76 @@ async fn update_article(mut req: Request, ctx: RouteContext<AppConfig>) -> Resul
         .await?
         .is_none()
     {
-        return fail(404, "NOT_FOUND", "That article is not available.", None);
+        return fail(404, "NOT_FOUND", "That page is not available.", None);
     }
-    store::update_article(
+    let now = now_ms();
+    let updated = store::update_article(
         &db,
         &article_id,
         &company_id,
         &title,
         &article_body,
+        &content_json,
+        expected_updated_at,
+        now,
+    )
+    .await?;
+    if !updated {
+        return fail(
+            409,
+            "CONFLICT",
+            "Someone else saved this page. Reload before editing again.",
+            None,
+        );
+    }
+    Response::from_json(&json!({"ok": true, "data": {"updatedAt": now}}))
+}
+
+async fn move_article(mut req: Request, ctx: RouteContext<AppConfig>) -> Result<Response> {
+    let company_id = param(&ctx, "company_id")?;
+    let article_id = param(&ctx, "article_id")?;
+    let body: ArticleMove = read_body!(req);
+    let position = form!(require_position(&body.position));
+    let parent_id = body
+        .parent_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let db = ctx.env.d1("DB")?;
+    match access(&req, &db, &company_id, Action::WriteArticle).await? {
+        Access::Allow(_) => {}
+        Access::Deny(response) => return Ok(response),
+    }
+    let Some(page) = store::get_article(&db, &company_id, &article_id).await? else {
+        return fail(404, "NOT_FOUND", "That page is not available.", None);
+    };
+    if parent_id == Some(article_id.as_str()) {
+        return fail(
+            400,
+            "INVALID",
+            "A page cannot be its own parent.",
+            Some("parentId"),
+        );
+    }
+    if let Some(parent_id) = parent_id {
+        let Some(parent) = store::get_article(&db, &company_id, parent_id).await? else {
+            return fail(404, "NOT_FOUND", "That parent page is not available.", None);
+        };
+        if parent.space_id != page.space_id {
+            return fail(
+                400,
+                "INVALID",
+                "The parent page must be in the same space.",
+                Some("parentId"),
+            );
+        }
+    }
+    store::move_article(
+        &db,
+        &article_id,
+        &company_id,
+        parent_id,
+        &position,
         now_ms(),
     )
     .await?;
@@ -544,15 +839,9 @@ async fn delete_article(req: Request, ctx: RouteContext<AppConfig>) -> Result<Re
         .await?
         .is_none()
     {
-        return fail(404, "NOT_FOUND", "That article is not available.", None);
+        return fail(404, "NOT_FOUND", "That page is not available.", None);
     }
-    let keys = store::list_attachment_keys(&db, &article_id).await?;
-    let files = ctx.env.bucket("FILES")?;
-    for key in keys {
-        files.delete(key).await?;
-    }
-    store::delete_attachments(&db, &article_id).await?;
-    store::delete_article(&db, &article_id, &company_id).await?;
+    store::delete_article(&db, &article_id, &company_id, now_ms()).await?;
     Response::from_json(&json!({"ok": true}))
 }
 
@@ -568,7 +857,7 @@ async fn list_attachments(req: Request, ctx: RouteContext<AppConfig>) -> Result<
         .await?
         .is_none()
     {
-        return fail(404, "NOT_FOUND", "That article is not available.", None);
+        return fail(404, "NOT_FOUND", "That page is not available.", None);
     }
     let rows = store::list_attachments(&db, &company_id, &article_id).await?;
     let data: Vec<Value> = rows
@@ -603,7 +892,7 @@ async fn upload_attachment(mut req: Request, ctx: RouteContext<AppConfig>) -> Re
         .await?
         .is_none()
     {
-        return fail(404, "NOT_FOUND", "That article is not available.", None);
+        return fail(404, "NOT_FOUND", "That page is not available.", None);
     }
     let id = random_token();
     let object_key = format!("companies/{company_id}/articles/{article_id}/{id}");
@@ -899,6 +1188,57 @@ async fn email_limited(db: &D1Database, email: &str, now_ms: i64) -> Result<bool
 async fn webauthn_limited(db: &D1Database, email: &str, now_ms: i64) -> Result<bool> {
     let recent = store::count_webauthn_challenges(db, email, now_ms - 60 * 60 * 1000).await?;
     Ok(recent >= WEBAUTHN_CHALLENGES_PER_HOUR)
+}
+
+fn page_summary_json(row: &store::ArticleRow) -> Value {
+    json!({
+        "id": row.id,
+        "spaceId": row.space_id,
+        "parentId": row.parent_id,
+        "position": row.position,
+        "icon": row.icon,
+        "title": row.title,
+        "authorId": row.author_id,
+        "updatedAt": row.updated_at
+    })
+}
+
+fn page_json(row: &store::ArticleRow) -> Value {
+    let content = if row.content_json.trim().is_empty() {
+        json!({
+            "type": "doc",
+            "content": [{
+                "type": "paragraph",
+                "content": if row.body.is_empty() {
+                    vec![]
+                } else {
+                    vec![json!({"type": "text", "text": row.body})]
+                }
+            }]
+        })
+    } else {
+        serde_json::from_str(&row.content_json).unwrap_or_else(|_| {
+            json!({
+                "type": "doc",
+                "content": [{
+                    "type": "paragraph",
+                    "content": [{"type": "text", "text": row.body}]
+                }]
+            })
+        })
+    };
+    json!({
+        "id": row.id,
+        "spaceId": row.space_id,
+        "parentId": row.parent_id,
+        "position": row.position,
+        "icon": row.icon,
+        "title": row.title,
+        "body": row.body,
+        "content": content,
+        "authorId": row.author_id,
+        "updatedAt": row.updated_at
+    })
 }
 
 fn fail(status: u16, code: &str, message: &str, field_name: Option<&str>) -> Result<Response> {
