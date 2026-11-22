@@ -1,0 +1,64 @@
+name: deploy
+
+on:
+  push:
+    branches: [staging, production]
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
+        with:
+          version: 12
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc
+        with:
+          toolchain: 1.97.1
+          targets: wasm32-unknown-unknown
+      - run: cargo install worker-build --version 0.9.0 --locked
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --dir web build
+      - name: Apply database migrations
+        working-directory: worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          if [ "${{ github.ref_name }}" = "production" ]; then
+            database=knowledgetrackr
+          else
+            database=knowledgetrackr-staging
+          fi
+          pnpm exec wrangler d1 migrations apply "$database" --remote --env "${{ github.ref_name }}"
+      - name: Deploy the Worker
+        working-directory: worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: pnpm exec wrangler deploy --env "${{ github.ref_name }}"
+      - name: Smoke test
+        env:
+          TARGET: ${{ github.ref_name }}
+        run: |
+          if [ "$TARGET" = "production" ]; then
+            url=https://knowledgetrackr.com/api/health
+          else
+            url=https://staging.knowledgetrackr.com/api/health
+          fi
+          for _ in $(seq 1 30); do
+            headers=$(mktemp)
+            if curl -fsS -D "$headers" "$url" | grep -q '"ok":true'; then
+              grep -qi '^x-content-type-options: nosniff' "$headers"
+              exit $?
+            fi
+            sleep 2
+          done
+          echo "health check failed for $url" >&2
+          exit 1

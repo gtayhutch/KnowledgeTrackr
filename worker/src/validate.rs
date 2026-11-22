@@ -53,7 +53,9 @@ pub struct CeremonyBody {
     pub display_name: Option<String>,
     /// Credential id, base64url.
     pub credential_id: String,
-    /// `clientDataJSON`, base64url.
+    /// `clientDataJSON`, base64url. Serde's camelCase rename would emit
+    /// `clientDataJson`, which is not the WebAuthn field name.
+    #[serde(rename = "clientDataJSON")]
     pub client_data_json: String,
     /// `authenticatorData`, base64url.
     pub authenticator_data: String,
@@ -204,6 +206,15 @@ pub fn decode_b64(field: &'static str, value: &str) -> Result<Vec<u8>, InvalidIn
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ceremony_body_accepts_the_webauthn_field_name() {
+        let parsed = serde_json::from_str::<CeremonyBody>(
+            r#"{"credentialId":"cred","clientDataJSON":"data","authenticatorData":"auth"}"#,
+        )
+        .expect("clientDataJSON is the name the browser sends");
+        assert_eq!(parsed.client_data_json, "data");
+    }
 
     #[test]
     fn article_write_rejects_a_company_id_field() {
