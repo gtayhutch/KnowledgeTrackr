@@ -1,6 +1,6 @@
-import { useEffect, useState, type FormEvent } from "react";
-import { api, ApiError, uploadFile } from "./api";
-import { Button, Input, Label, QuietButton, TextArea } from "./components";
+import { lazy, Suspense, useEffect, useState, type FormEvent } from "react";
+import { api, ApiError } from "./api";
+import { Button, Input, Label, QuietButton } from "./components";
 import {
   createPasskey,
   getPasskey,
@@ -8,31 +8,46 @@ import {
   type RequestOptions,
 } from "./passkey";
 
+const PageEditor = lazy(() =>
+  import("./editor/PageEditor").then((module) => ({
+    default: module.PageEditor,
+  })),
+);
+
 type Session = {
   user: { id: string; email: string; displayName: string };
   companies: { id: string; name: string; role: string }[];
 };
 
-type Article = {
+type Space = {
   id: string;
-  title: string;
-  body: string;
-  authorId: string;
-  updatedAt: number;
+  name: string;
+  slug: string;
+  description: string;
 };
 
-type Attachment = {
+type Article = {
   id: string;
-  fileName: string;
-  contentType: string;
-  byteSize: number;
+  spaceId: string;
+  parentId: string | null;
+  position: string;
+  icon: string | null;
+  title: string;
+  authorId: string;
+  updatedAt: number;
 };
 
 type Route =
   | { screen: "sign-in" }
   | { screen: "enroll"; token?: string }
   | { screen: "recover"; token?: string }
-  | { screen: "library"; companyId?: string; articleId?: string };
+  | {
+      screen: "library";
+      companyId?: string;
+      spaceId?: string;
+      articleId?: string;
+      composing?: boolean;
+    };
 
 /** KnowledgeTrackr. Hash routes keep the email links free of a router package. */
 export function App() {
@@ -100,7 +115,9 @@ export function App() {
           <Library
             session={session}
             companyId={route.companyId}
+            spaceId={route.spaceId}
             articleId={route.articleId}
+            composing={route.composing === true}
             onChanged={() => void refresh()}
           />
         ) : (
@@ -380,68 +397,74 @@ function Recover({
 function Library({
   session,
   companyId,
+  spaceId,
   articleId,
+  composing,
   onChanged,
 }: {
   session: Session;
   companyId?: string;
+  spaceId?: string;
   articleId?: string;
+  composing: boolean;
   onChanged: () => void;
 }) {
   const company =
     session.companies.find((item) => item.id === companyId) ??
     session.companies[0];
   const [name, setName] = useState("");
+  const [spaceName, setSpaceName] = useState("");
   const [memberEmail, setMemberEmail] = useState("");
   const [memberRole, setMemberRole] = useState("member");
   const [query, setQuery] = useState("");
+  const [spaces, setSpaces] = useState<Space[]>([]);
   const [articles, setArticles] = useState<Article[]>([]);
-  const [title, setTitle] = useState("");
-  const [body, setBody] = useState("");
-  const [files, setFiles] = useState<Attachment[]>([]);
+  const [parentId, setParentId] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
+  const [draggingId, setDraggingId] = useState<string | null>(null);
+
+  const activeCompanyId = companyId ?? company?.id;
+  const activeSpace =
+    spaces.find((item) => item.id === spaceId) ?? spaces[0] ?? null;
+  const activeSpaceId = spaceId ?? activeSpace?.id;
 
   useEffect(() => {
-    if (!company) return;
-    const activeId = companyId ?? company.id;
-    void api<Article[]>(
-      `/api/companies/${activeId}/articles?q=${encodeURIComponent(query)}`,
-    )
+    if (!activeCompanyId) return;
+    void api<Space[]>(`/api/companies/${activeCompanyId}/spaces`)
+      .then((next) => {
+        setSpaces(next);
+        if (!spaceId && next[0]) {
+          location.hash = `#/app/${activeCompanyId}/${next[0].id}`;
+        }
+      })
+      .catch((error: unknown) => setMessage(messageOf(error)));
+  }, [activeCompanyId, spaceId]);
+
+  useEffect(() => {
+    if (!activeCompanyId || !activeSpaceId) return;
+    const path = query
+      ? `/api/companies/${activeCompanyId}/articles?spaceId=${encodeURIComponent(activeSpaceId)}&q=${encodeURIComponent(query)}`
+      : `/api/companies/${activeCompanyId}/articles?spaceId=${encodeURIComponent(activeSpaceId)}`;
+    void api<Article[]>(path)
       .then(setArticles)
       .catch((error: unknown) => setMessage(messageOf(error)));
-  }, [company, companyId, query]);
-
-  useEffect(() => {
-    if (!company || !articleId) {
-      setTitle("");
-      setBody("");
-      setFiles([]);
-      return;
-    }
-    const activeId = companyId ?? company.id;
-    void api<Article>(`/api/companies/${activeId}/articles/${articleId}`).then(
-      (article) => {
-        setTitle(article.title);
-        setBody(article.body);
-      },
-    );
-    void api<Attachment[]>(
-      `/api/companies/${activeId}/articles/${articleId}/attachments`,
-    ).then(setFiles);
-  }, [articleId, company, companyId]);
+  }, [activeCompanyId, activeSpaceId, query]);
 
   async function createCompany(event: FormEvent) {
     event.preventDefault();
-    const created = await api<{ id: string }>("/api/companies", {
-      method: "POST",
-      body: JSON.stringify({ name }),
-    });
+    const created = await api<{ id: string; defaultSpaceId: string }>(
+      "/api/companies",
+      {
+        method: "POST",
+        body: JSON.stringify({ name }),
+      },
+    );
     setName("");
     onChanged();
-    location.hash = `#/app/${created.id}`;
+    location.hash = `#/app/${created.id}/${created.defaultSpaceId}`;
   }
 
-  if (!company) {
+  if (!company || !activeCompanyId) {
     return (
       <form
         onSubmit={(event) => void createCompany(event)}
@@ -462,55 +485,67 @@ function Library({
     );
   }
 
-  const activeCompanyId = companyId ?? company.id;
+  async function refreshPages() {
+    if (!activeSpaceId) return;
+    const path = query
+      ? `/api/companies/${activeCompanyId}/articles?spaceId=${encodeURIComponent(activeSpaceId)}&q=${encodeURIComponent(query)}`
+      : `/api/companies/${activeCompanyId}/articles?spaceId=${encodeURIComponent(activeSpaceId)}`;
+    setArticles(await api<Article[]>(path));
+  }
 
-  async function saveArticle(event: FormEvent) {
+  async function createSpace(event: FormEvent) {
     event.preventDefault();
     setMessage(null);
     try {
-      if (articleId) {
-        await api(`/api/companies/${activeCompanyId}/articles/${articleId}`, {
-          method: "PUT",
-          body: JSON.stringify({ title, body }),
-        });
-      } else {
-        const created = await api<{ id: string }>(
-          `/api/companies/${activeCompanyId}/articles`,
-          {
-            method: "POST",
-            body: JSON.stringify({ title, body }),
-          },
-        );
-        location.hash = `#/app/${activeCompanyId}/${created.id}`;
-      }
-      const next = await api<Article[]>(
-        `/api/companies/${activeCompanyId}/articles?q=${encodeURIComponent(query)}`,
+      const created = await api<{ id: string }>(
+        `/api/companies/${activeCompanyId}/spaces`,
+        {
+          method: "POST",
+          body: JSON.stringify({ name: spaceName }),
+        },
       );
-      setArticles(next);
+      setSpaceName("");
+      const next = await api<Space[]>(
+        `/api/companies/${activeCompanyId}/spaces`,
+      );
+      setSpaces(next);
+      location.hash = `#/app/${activeCompanyId}/${created.id}`;
     } catch (error) {
       setMessage(messageOf(error));
     }
   }
 
-  async function onUpload(file: File | undefined) {
-    if (!file || !articleId) return;
+  async function dropOn(targetId: string | null) {
+    if (!draggingId || draggingId === targetId || !activeSpaceId) return;
     setMessage(null);
     try {
-      await uploadFile(activeCompanyId, articleId, file);
-      setFiles(
-        await api<Attachment[]>(
-          `/api/companies/${activeCompanyId}/articles/${articleId}/attachments`,
-        ),
+      await api(
+        `/api/companies/${activeCompanyId}/articles/${draggingId}/move`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            parentId: targetId,
+            position: `${Date.now()}`,
+          }),
+        },
       );
+      setDraggingId(null);
+      await refreshPages();
     } catch (error) {
       setMessage(messageOf(error));
+      setDraggingId(null);
     }
   }
+
+  const recent = [...articles]
+    .sort((left, right) => right.updatedAt - left.updatedAt)
+    .slice(0, 8);
+  const tree = pageTree(articles);
 
   return (
     <div className="grid gap-8 md:grid-cols-[16rem_1fr]">
       <aside>
-        <ul className="mb-6 space-y-2 text-sm">
+        <ul className="mb-4 space-y-2 text-sm">
           {session.companies.map((item) => (
             <li key={item.id}>
               <a
@@ -533,6 +568,63 @@ function Library({
             Add
           </QuietButton>
         </form>
+        <h2 className="mb-2 text-sm font-semibold">Spaces</h2>
+        <ul className="mb-3 space-y-1 text-sm">
+          {spaces.map((item) => (
+            <li key={item.id}>
+              <a
+                href={`#/app/${activeCompanyId}/${item.id}`}
+                className={
+                  item.id === activeSpaceId ? "font-semibold" : undefined
+                }
+              >
+                {item.name}
+              </a>
+            </li>
+          ))}
+        </ul>
+        <form onSubmit={(event) => void createSpace(event)} className="mb-6">
+          <Label htmlFor="spaceName">New space</Label>
+          <Input
+            id="spaceName"
+            value={spaceName}
+            onChange={(event) => setSpaceName(event.target.value)}
+          />
+          <QuietButton className="mt-2" type="submit">
+            Add space
+          </QuietButton>
+        </form>
+        {activeSpaceId ? (
+          <div className="mb-6">
+            <div className="mb-2 flex items-center justify-between">
+              <h2 className="text-sm font-semibold">Pages</h2>
+              <a
+                className="text-xs"
+                href={`#/app/${activeCompanyId}/${activeSpaceId}/new`}
+              >
+                New
+              </a>
+            </div>
+            <ul
+              className="space-y-1 text-sm"
+              onDragOver={(event) => event.preventDefault()}
+              onDrop={() => void dropOn(null)}
+            >
+              {tree.map((node) => (
+                <PageTreeNode
+                  key={node.page.id}
+                  node={node}
+                  companyId={activeCompanyId}
+                  spaceId={activeSpaceId}
+                  selectedId={articleId}
+                  depth={0}
+                  onDragStart={setDraggingId}
+                  onDrop={(id) => void dropOn(id)}
+                />
+              ))}
+            </ul>
+          </div>
+        ) : null}
         {company.role === "admin" ? (
           <form
             onSubmit={(event) => {
@@ -580,66 +672,74 @@ function Library({
         >
           <Input
             name="q"
-            aria-label="Search articles"
-            placeholder="Search articles"
+            aria-label="Search pages"
+            placeholder="Search pages"
           />
           <QuietButton type="submit">Search</QuietButton>
         </form>
-        <ul className="mb-6 divide-y divide-rule border-y border-rule text-sm">
-          {articles.map((article) => (
-            <li key={article.id}>
-              <a
-                className="block py-2"
-                href={`#/app/${activeCompanyId}/${article.id}`}
-              >
-                {article.title}
-              </a>
-            </li>
-          ))}
-        </ul>
-        <form onSubmit={(event) => void saveArticle(event)}>
-          <h1 className="mb-4 text-3xl">
-            {articleId ? "Edit article" : "New article"}
-          </h1>
-          <Label htmlFor="title">Title</Label>
-          <Input
-            id="title"
-            value={title}
-            onChange={(event) => setTitle(event.target.value)}
-            required
-          />
-          <div className="mt-4">
-            <Label htmlFor="body">Body</Label>
-            <TextArea
-              id="body"
-              value={body}
-              onChange={(event) => setBody(event.target.value)}
-            />
-          </div>
-          {message ? <p className="mt-3 text-sm">{message}</p> : null}
-          <Button className="mt-4" type="submit">
-            Save
-          </Button>
-        </form>
-        {articleId ? (
-          <div className="mt-8">
-            <h2 className="mb-2 text-xl">Files</h2>
-            <ul className="mb-3 text-sm">
-              {files.map((file) => (
-                <li key={file.id}>
+        {!articleId && !composing ? (
+          <div>
+            <h1 className="mb-2 text-3xl">
+              {activeSpace ? activeSpace.name : "Home"}
+            </h1>
+            <p className="mb-6 text-sm">
+              Recent pages in this space. Open one from the tree, or create a
+              new page.
+            </p>
+            <ul className="mb-6 divide-y divide-rule border-y border-rule text-sm">
+              {recent.map((page) => (
+                <li key={page.id}>
                   <a
-                    href={`/api/companies/${activeCompanyId}/attachments/${file.id}`}
+                    className="block py-2"
+                    href={`#/app/${activeCompanyId}/${activeSpaceId}/${page.id}`}
                   >
-                    {file.fileName}
+                    {page.title}
                   </a>
                 </li>
               ))}
             </ul>
-            <input
-              type="file"
-              aria-label="Upload a file"
-              onChange={(event) => void onUpload(event.target.files?.[0])}
-            />
+            {activeSpaceId ? (
+              <a href={`#/app/${activeCompanyId}/${activeSpaceId}/new`}>
+                <Button type="button">New page</Button>
+              </a>
+            ) : null}
+            {message ? <p className="mt-3 text-sm">{message}</p> : null}
+          </div>
+        ) : activeSpaceId ? (
+          <div>
+            {composing ? (
+              <div className="mb-4">
+                <Label htmlFor="parentId">Parent page</Label>
+                <select
+                  id="parentId"
+                  className="mt-1 h-10 w-full rounded-md border border-rule bg-white px-3 text-sm"
+                  value={parentId ?? ""}
+                  onChange={(event) => setParentId(event.target.value || null)}
+                >
+                  <option value="">None (top level)</option>
+                  {articles.map((page) => (
+                    <option key={page.id} value={page.id}>
+                      {page.title}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            ) : null}
+            {message ? <p className="mb-3 text-sm">{message}</p> : null}
+            <Suspense fallback={<p className="text-sm">Loading editor…</p>}>
+              <PageEditor
+                companyId={activeCompanyId}
+                spaceId={activeSpaceId}
+                pageId={articleId}
+                parentId={parentId}
+                composing={composing}
+                onMessage={setMessage}
+                onCreated={(id) => {
+                  void refreshPages();
+                  location.hash = `#/app/${activeCompanyId}/${activeSpaceId}/${id}`;
+                }}
+              />
+            </Suspense>
           </div>
         ) : null}
       </section>
@@ -647,12 +747,113 @@ function Library({
   );
 }
 
+type TreeNode = { page: Article; children: TreeNode[] };
+
+function pageTree(pages: Article[]): TreeNode[] {
+  const byParent = new Map<string | null, Article[]>();
+  for (const page of pages) {
+    const key = page.parentId;
+    const list = byParent.get(key) ?? [];
+    list.push(page);
+    byParent.set(key, list);
+  }
+  for (const list of byParent.values()) {
+    list.sort((left, right) => {
+      const byPosition = left.position.localeCompare(right.position);
+      return byPosition !== 0
+        ? byPosition
+        : left.title.localeCompare(right.title);
+    });
+  }
+  function walk(parent: string | null): TreeNode[] {
+    return (byParent.get(parent) ?? []).map((page) => ({
+      page,
+      children: walk(page.id),
+    }));
+  }
+  return walk(null);
+}
+
+function PageTreeNode({
+  node,
+  companyId,
+  spaceId,
+  selectedId,
+  depth,
+  onDragStart,
+  onDrop,
+}: {
+  node: TreeNode;
+  companyId: string;
+  spaceId: string;
+  selectedId?: string;
+  depth: number;
+  onDragStart: (id: string) => void;
+  onDrop: (id: string) => void;
+}) {
+  return (
+    <li>
+      <a
+        href={`#/app/${companyId}/${spaceId}/${node.page.id}`}
+        className={`block truncate py-0.5 ${selectedId === node.page.id ? "font-semibold" : ""}`}
+        style={{ paddingLeft: `${depth * 0.75}rem` }}
+        draggable
+        onDragStart={() => onDragStart(node.page.id)}
+        onDragOver={(event) => event.preventDefault()}
+        onDrop={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          onDrop(node.page.id);
+        }}
+      >
+        {node.page.title}
+      </a>
+      {node.children.length > 0 ? (
+        <ul>
+          {node.children.map((child) => (
+            <PageTreeNode
+              key={child.page.id}
+              node={child}
+              companyId={companyId}
+              spaceId={spaceId}
+              selectedId={selectedId}
+              depth={depth + 1}
+              onDragStart={onDragStart}
+              onDrop={onDrop}
+            />
+          ))}
+        </ul>
+      ) : null}
+    </li>
+  );
+}
+
 function readRoute(): Route {
   const parts = location.hash.replace(/^#/, "").split("/").filter(Boolean);
   if (parts[0] === "enroll") return { screen: "enroll", token: parts[1] };
   if (parts[0] === "recover") return { screen: "recover", token: parts[1] };
-  if (parts[0] === "app")
-    return { screen: "library", companyId: parts[1], articleId: parts[2] };
+  if (parts[0] === "app") {
+    const companyId = parts[1];
+    const spaceOrPage = parts[2];
+    const pageOrNew = parts[3];
+    if (pageOrNew === "new") {
+      return {
+        screen: "library",
+        companyId,
+        spaceId: spaceOrPage,
+        composing: true,
+      };
+    }
+    if (pageOrNew) {
+      return {
+        screen: "library",
+        companyId,
+        spaceId: spaceOrPage,
+        articleId: pageOrNew,
+      };
+    }
+    return { screen: "library", companyId, spaceId: spaceOrPage };
+  }
   if (parts.length === 0) return { screen: "sign-in" };
   return { screen: "sign-in" };
 }

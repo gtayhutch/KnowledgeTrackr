@@ -18,7 +18,7 @@ pub enum Actor {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
-    /// Reads and writes that company's articles and files.
+    /// Reads and writes that company's spaces, pages, and files.
     Member,
     /// Member rights, plus membership changes and company rename.
     Admin,
@@ -44,9 +44,9 @@ pub enum Action {
     UpdateCompany,
     /// Add or change a member.
     ManageMembers,
-    /// List or open articles and their files.
+    /// List or open spaces, pages, and their files.
     ReadArticle,
-    /// Create, edit, or delete articles and files.
+    /// Create, edit, or delete spaces, pages, and files.
     WriteArticle,
 }
 
