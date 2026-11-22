@@ -18,6 +18,22 @@ pub const WEBAUTHN_CHALLENGES_PER_HOUR: i64 = 20;
 /// Largest accepted attachment, in bytes.
 pub const MAX_UPLOAD_BYTES: usize = 10 * 1024 * 1024;
 
+/// Largest accepted TipTap JSON document, in UTF-8 bytes.
+pub const MAX_CONTENT_JSON_BYTES: usize = 200 * 1024;
+
+/// Largest derived plain-text body, in Unicode scalar values.
+pub const MAX_BODY_CHARS: usize = 100_000;
+
+/// Hosts allowed inside embed nodes in page content.
+pub const ALLOWED_EMBED_HOSTS: [&str; 6] = [
+    "www.youtube.com",
+    "youtube.com",
+    "www.loom.com",
+    "loom.com",
+    "www.figma.com",
+    "figma.com",
+];
+
 /// Content types an attachment may use.
 pub const ALLOWED_CONTENT_TYPES: [&str; 6] = [
     "image/png",

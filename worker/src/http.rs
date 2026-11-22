@@ -16,10 +16,10 @@ use crate::limits::{
 use crate::search_query::fts_match;
 use crate::store::{self, PasskeyRow};
 use crate::validate::{
-    decode_b64, require_article, require_description, require_display_name, require_email,
-    require_label, require_position, require_slug, require_upload, slug_from_name, ArticleMove,
-    ArticleWrite, CeremonyBody, CompanyName, EmailLink, EmailStart, NewCompany, NewMember,
-    SpaceWrite,
+    decode_b64, require_description, require_display_name, require_email, require_label,
+    require_page_content, require_position, require_slug, require_upload, slug_from_name,
+    ArticleMove, ArticleWrite, CeremonyBody, CompanyName, EmailLink, EmailStart, NewCompany,
+    NewMember, SpaceWrite,
 };
 use crate::webauthn::{
     challenge_expiry, new_challenge, verify_authentication, verify_registration, CeremonyResponse,
@@ -80,6 +80,10 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         .post_async("/api/companies", create_company)
         .patch_async("/api/companies/:company_id", rename_company)
         .post_async("/api/companies/:company_id/members", add_member)
+        .get_async(
+            "/api/companies/:company_id/mention-targets",
+            mention_targets,
+        )
         .get_async("/api/companies/:company_id/spaces", list_spaces)
         .post_async("/api/companies/:company_id/spaces", create_space)
         .patch_async("/api/companies/:company_id/spaces/:space_id", rename_space)
@@ -600,14 +604,60 @@ async fn list_articles(req: Request, ctx: RouteContext<AppConfig>) -> Result<Res
         fts_match(&query).as_deref(),
     )
     .await?;
-    let data: Vec<Value> = rows.iter().map(page_json).collect();
+    let data: Vec<Value> = rows.iter().map(page_summary_json).collect();
     Response::from_json(&json!({"ok": true, "data": data}))
+}
+
+async fn mention_targets(req: Request, ctx: RouteContext<AppConfig>) -> Result<Response> {
+    let company_id = param(&ctx, "company_id")?;
+    let url = req.url()?;
+    let space_id = url
+        .query_pairs()
+        .find(|(key, _)| key == "spaceId")
+        .map(|(_, value)| value.into_owned());
+    let db = ctx.env.d1("DB")?;
+    match access(&req, &db, &company_id, Action::ReadArticle).await? {
+        Access::Allow(_) => {}
+        Access::Deny(response) => return Ok(response),
+    }
+    let members = store::list_company_members(&db, &company_id).await?;
+    let pages = store::list_articles(&db, &company_id, space_id.as_deref(), None).await?;
+    let people: Vec<Value> = members
+        .iter()
+        .map(|row| {
+            json!({
+                "id": row.id,
+                "label": row.display_name,
+                "email": row.email,
+                "kind": "person"
+            })
+        })
+        .collect();
+    let page_targets: Vec<Value> = pages
+        .iter()
+        .map(|row| {
+            json!({
+                "id": row.id,
+                "label": row.title,
+                "spaceId": row.space_id,
+                "kind": "page"
+            })
+        })
+        .collect();
+    Response::from_json(&json!({
+        "ok": true,
+        "data": {
+            "people": people,
+            "pages": page_targets
+        }
+    }))
 }
 
 async fn create_article(mut req: Request, ctx: RouteContext<AppConfig>) -> Result<Response> {
     let company_id = param(&ctx, "company_id")?;
     let body: ArticleWrite = read_body!(req);
-    let (title, article_body) = form!(require_article(&body.title, &body.body));
+    let (title, content_json, article_body) =
+        form!(require_page_content(&body.title, &body.content));
     let Some(space_id) = body
         .space_id
         .as_deref()
@@ -646,6 +696,7 @@ async fn create_article(mut req: Request, ctx: RouteContext<AppConfig>) -> Resul
         }
     }
     let id = random_token();
+    let now = now_ms();
     store::insert_article(
         &db,
         &id,
@@ -655,11 +706,12 @@ async fn create_article(mut req: Request, ctx: RouteContext<AppConfig>) -> Resul
         &id,
         &title,
         &article_body,
+        &content_json,
         &user_id,
-        now_ms(),
+        now,
     )
     .await?;
-    Response::from_json(&json!({"ok": true, "data": {"id": id}}))
+    Response::from_json(&json!({"ok": true, "data": {"id": id, "updatedAt": now}}))
 }
 
 async fn read_article(req: Request, ctx: RouteContext<AppConfig>) -> Result<Response> {
@@ -680,7 +732,16 @@ async fn update_article(mut req: Request, ctx: RouteContext<AppConfig>) -> Resul
     let company_id = param(&ctx, "company_id")?;
     let article_id = param(&ctx, "article_id")?;
     let body: ArticleWrite = read_body!(req);
-    let (title, article_body) = form!(require_article(&body.title, &body.body));
+    let (title, content_json, article_body) =
+        form!(require_page_content(&body.title, &body.content));
+    let Some(expected_updated_at) = body.expected_updated_at else {
+        return fail(
+            400,
+            "INVALID",
+            "Send the last saved time.",
+            Some("expectedUpdatedAt"),
+        );
+    };
     let db = ctx.env.d1("DB")?;
     match access(&req, &db, &company_id, Action::WriteArticle).await? {
         Access::Allow(_) => {}
@@ -692,16 +753,27 @@ async fn update_article(mut req: Request, ctx: RouteContext<AppConfig>) -> Resul
     {
         return fail(404, "NOT_FOUND", "That page is not available.", None);
     }
-    store::update_article(
+    let now = now_ms();
+    let updated = store::update_article(
         &db,
         &article_id,
         &company_id,
         &title,
         &article_body,
-        now_ms(),
+        &content_json,
+        expected_updated_at,
+        now,
     )
     .await?;
-    Response::from_json(&json!({"ok": true}))
+    if !updated {
+        return fail(
+            409,
+            "CONFLICT",
+            "Someone else saved this page. Reload before editing again.",
+            None,
+        );
+    }
+    Response::from_json(&json!({"ok": true, "data": {"updatedAt": now}}))
 }
 
 async fn move_article(mut req: Request, ctx: RouteContext<AppConfig>) -> Result<Response> {
@@ -1118,7 +1190,43 @@ async fn webauthn_limited(db: &D1Database, email: &str, now_ms: i64) -> Result<b
     Ok(recent >= WEBAUTHN_CHALLENGES_PER_HOUR)
 }
 
+fn page_summary_json(row: &store::ArticleRow) -> Value {
+    json!({
+        "id": row.id,
+        "spaceId": row.space_id,
+        "parentId": row.parent_id,
+        "position": row.position,
+        "icon": row.icon,
+        "title": row.title,
+        "authorId": row.author_id,
+        "updatedAt": row.updated_at
+    })
+}
+
 fn page_json(row: &store::ArticleRow) -> Value {
+    let content = if row.content_json.trim().is_empty() {
+        json!({
+            "type": "doc",
+            "content": [{
+                "type": "paragraph",
+                "content": if row.body.is_empty() {
+                    vec![]
+                } else {
+                    vec![json!({"type": "text", "text": row.body})]
+                }
+            }]
+        })
+    } else {
+        serde_json::from_str(&row.content_json).unwrap_or_else(|_| {
+            json!({
+                "type": "doc",
+                "content": [{
+                    "type": "paragraph",
+                    "content": [{"type": "text", "text": row.body}]
+                }]
+            })
+        })
+    };
     json!({
         "id": row.id,
         "spaceId": row.space_id,
@@ -1127,6 +1235,7 @@ fn page_json(row: &store::ArticleRow) -> Value {
         "icon": row.icon,
         "title": row.title,
         "body": row.body,
+        "content": content,
         "authorId": row.author_id,
         "updatedAt": row.updated_at
     })

@@ -3,9 +3,13 @@
 
 use base64::Engine;
 use serde::Deserialize;
+use serde_json::Value;
 
 use crate::authz::Role;
-use crate::limits::{content_type_allowed, MAX_UPLOAD_BYTES};
+use crate::limits::{
+    content_type_allowed, ALLOWED_EMBED_HOSTS, MAX_BODY_CHARS, MAX_CONTENT_JSON_BYTES,
+    MAX_UPLOAD_BYTES,
+};
 
 /// Why a request body was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,20 +111,23 @@ pub struct SpaceWrite {
     pub slug: Option<String>,
 }
 
-/// Create or replace a Page's text.
+/// Create or replace a Page's TipTap document (ADR 0011).
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ArticleWrite {
     /// Page title.
     pub title: String,
-    /// Page body, markdown or plain text.
-    pub body: String,
+    /// TipTap JSON document.
+    pub content: Value,
     /// Space that owns a new page. Required on create; ignored on update.
     #[serde(default)]
     pub space_id: Option<String>,
     /// Parent page for a new nested page.
     #[serde(default)]
     pub parent_id: Option<String>,
+    /// Client's last-seen `updatedAt`. Required on update for conflict checks.
+    #[serde(default)]
+    pub expected_updated_at: Option<i64>,
 }
 
 /// Reparent or reorder a Page inside its Space.
@@ -229,16 +236,136 @@ pub fn slug_from_name(name: &str) -> String {
     out.trim_matches('-').to_string()
 }
 
-/// Checks page text lengths.
-pub fn require_article(title: &str, body: &str) -> Result<(String, String), InvalidInput> {
+/// Validates TipTap JSON, derives FTS plain text, and returns serialized JSON.
+pub fn require_page_content(
+    title: &str,
+    content: &Value,
+) -> Result<(String, String, String), InvalidInput> {
     let title = require_label("title", title, 200)?;
-    if body.chars().count() > 100_000 {
+    if !content.is_object() {
         return Err(InvalidInput {
-            field: "body",
+            field: "content",
+            message: "The page content is invalid.",
+        });
+    }
+    let serialized = serde_json::to_string(content).map_err(|_| InvalidInput {
+        field: "content",
+        message: "The page content is invalid.",
+    })?;
+    if serialized.len() > MAX_CONTENT_JSON_BYTES {
+        return Err(InvalidInput {
+            field: "content",
             message: "The page is too long.",
         });
     }
-    Ok((title, body.to_string()))
+    check_embeds(content)?;
+    let body = plain_text_from_json(content);
+    if body.chars().count() > MAX_BODY_CHARS {
+        return Err(InvalidInput {
+            field: "content",
+            message: "The page is too long.",
+        });
+    }
+    Ok((title, serialized, body))
+}
+
+/// Collects string leaves from TipTap JSON for FTS5.
+pub fn plain_text_from_json(value: &Value) -> String {
+    let mut parts = Vec::new();
+    walk_strings(value, &mut parts);
+    parts.join(" ")
+}
+
+fn walk_strings(value: &Value, parts: &mut Vec<String>) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                walk_strings(item, parts);
+            }
+        }
+        Value::Object(map) => {
+            // TipTap text nodes use `text`. Code/mermaid sources often live there too.
+            if let Some(Value::String(text)) = map.get("text") {
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    parts.push(trimmed.to_string());
+                }
+            }
+            if let Some(child) = map.get("content") {
+                walk_strings(child, parts);
+            }
+            if let Some(Value::Object(attrs)) = map.get("attrs") {
+                for key in ["title", "label", "alt"] {
+                    if let Some(Value::String(text)) = attrs.get(key) {
+                        let trimmed = text.trim();
+                        if !trimmed.is_empty() {
+                            parts.push(trimmed.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn check_embeds(value: &Value) -> Result<(), InvalidInput> {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                check_embeds(item)?;
+            }
+        }
+        Value::Object(map) => {
+            if map.get("type").and_then(Value::as_str) == Some("embed") {
+                let attrs = map.get("attrs").and_then(Value::as_object);
+                let url = attrs
+                    .and_then(|attrs| attrs.get("src").or_else(|| attrs.get("url")))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                require_embed_url(url)?;
+            }
+            for child in map.values() {
+                check_embeds(child)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Checks an embed URL against the allowlisted hosts.
+pub fn require_embed_url(url: &str) -> Result<String, InvalidInput> {
+    let url = url.trim();
+    if url.is_empty() || url.len() > 2000 || url.chars().any(|ch| ch.is_whitespace() || ch == '\\')
+    {
+        return Err(InvalidInput {
+            field: "content",
+            message: "That embed link is not allowed.",
+        });
+    }
+    let Some(rest) = url.strip_prefix("https://") else {
+        return Err(InvalidInput {
+            field: "content",
+            message: "That embed link is not allowed.",
+        });
+    };
+    let host_port = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = host_port
+        .rsplit('@')
+        .next()
+        .unwrap_or("")
+        .split(':')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if host.is_empty() || !ALLOWED_EMBED_HOSTS.contains(&host.as_str()) {
+        return Err(InvalidInput {
+            field: "content",
+            message: "That embed link is not allowed.",
+        });
+    }
+    Ok(url.to_string())
 }
 
 /// Checks a Space description.
@@ -321,9 +448,34 @@ mod tests {
     #[test]
     fn article_write_rejects_a_company_id_field() {
         let parsed = serde_json::from_str::<ArticleWrite>(
-            r#"{"title":"Hello","body":"Text","companyId":"other"}"#,
+            r#"{"title":"Hello","content":{"type":"doc","content":[]},"companyId":"other"}"#,
         );
         assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn page_content_derives_plain_text_and_rejects_bad_embeds() {
+        let content = serde_json::json!({
+            "type": "doc",
+            "content": [{
+                "type": "paragraph",
+                "content": [{"type": "text", "text": "Hello"}]
+            }]
+        });
+        let (_, json, body) = require_page_content("Title", &content).unwrap();
+        assert!(json.contains("Hello"));
+        assert_eq!(body, "Hello");
+
+        let bad = serde_json::json!({
+            "type": "doc",
+            "content": [{
+                "type": "embed",
+                "attrs": {"src": "https://evil.example/x"}
+            }]
+        });
+        assert!(require_page_content("Title", &bad).is_err());
+        assert!(require_embed_url("https://www.youtube.com/embed/abc").is_ok());
+        assert!(require_embed_url("http://www.youtube.com/embed/abc").is_err());
     }
 
     #[test]

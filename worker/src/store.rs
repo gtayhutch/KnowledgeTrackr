@@ -79,12 +79,25 @@ pub struct ArticleRow {
     pub icon: Option<String>,
     /// Title.
     pub title: String,
-    /// Body.
+    /// Derived plain text for FTS5 (ADR 0011).
     pub body: String,
+    /// TipTap JSON document. Empty for legacy plain-text pages.
+    pub content_json: String,
     /// Author account id.
     pub author_id: String,
     /// Last edit, unix milliseconds.
     pub updated_at: i64,
+}
+
+/// A company member row for mention typeahead.
+#[derive(Debug, Deserialize)]
+pub struct CompanyMemberRow {
+    /// Account id.
+    pub id: String,
+    /// Display name.
+    pub display_name: String,
+    /// Email.
+    pub email: String,
 }
 
 /// Attachment metadata needed to stream the object. The query already
@@ -598,7 +611,7 @@ pub async fn insert_membership(
     Ok(())
 }
 
-/// Inserts a Page. The FTS trigger indexes it.
+/// Inserts a Page. The FTS trigger indexes derived `body`.
 #[allow(clippy::too_many_arguments)]
 pub async fn insert_article(
     db: &D1Database,
@@ -609,14 +622,15 @@ pub async fn insert_article(
     position: &str,
     title: &str,
     body: &str,
+    content_json: &str,
     author_id: &str,
     now_ms: i64,
 ) -> Result<()> {
     db.prepare(
         "INSERT INTO articles
-         (id, company_id, space_id, parent_id, position, title, body, author_id,
-          created_at, updated_at, deleted_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, NULL)",
+         (id, company_id, space_id, parent_id, position, title, body, content_json,
+          author_id, created_at, updated_at, deleted_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, NULL)",
     )
     .bind(&[
         text(id),
@@ -629,6 +643,7 @@ pub async fn insert_article(
         text(position),
         text(title),
         text(body),
+        text(content_json),
         text(author_id),
         num(now_ms),
     ])?
@@ -637,29 +652,60 @@ pub async fn insert_article(
     Ok(())
 }
 
-/// Replaces a Page's title and body.
+/// Replaces a Page's title and TipTap document when `expected_updated_at` matches.
+#[allow(clippy::too_many_arguments)]
 pub async fn update_article(
     db: &D1Database,
     id: &str,
     company_id: &str,
     title: &str,
     body: &str,
+    content_json: &str,
+    expected_updated_at: i64,
     now_ms: i64,
-) -> Result<()> {
-    db.prepare(
-        "UPDATE articles SET title = ?1, body = ?2, updated_at = ?3
-         WHERE id = ?4 AND company_id = ?5 AND deleted_at IS NULL",
-    )
-    .bind(&[
-        text(title),
-        text(body),
-        num(now_ms),
-        text(id),
-        text(company_id),
-    ])?
-    .run()
-    .await?;
-    Ok(())
+) -> Result<bool> {
+    let result = db
+        .prepare(
+            "UPDATE articles SET title = ?1, body = ?2, content_json = ?3, updated_at = ?4
+             WHERE id = ?5 AND company_id = ?6 AND deleted_at IS NULL
+               AND updated_at = ?7",
+        )
+        .bind(&[
+            text(title),
+            text(body),
+            text(content_json),
+            num(now_ms),
+            text(id),
+            text(company_id),
+            num(expected_updated_at),
+        ])?
+        .run()
+        .await?;
+    Ok(result
+        .meta()?
+        .and_then(|meta| meta.rows_written)
+        .unwrap_or(0)
+        > 0)
+}
+
+/// Lists members of a company for mention typeahead.
+pub async fn list_company_members(
+    db: &D1Database,
+    company_id: &str,
+) -> Result<Vec<CompanyMemberRow>> {
+    let fetched = db
+        .prepare(
+            "SELECT u.id, u.display_name, u.email
+             FROM memberships m
+             JOIN users u ON u.id = m.user_id
+             WHERE m.company_id = ?1
+             ORDER BY u.display_name
+             LIMIT 100",
+        )
+        .bind(&[text(company_id)])?
+        .all()
+        .await?;
+    fetched.results()
 }
 
 /// Moves a Page under a new parent and/or sibling order.
@@ -714,7 +760,7 @@ pub async fn get_article(
     article_id: &str,
 ) -> Result<Option<ArticleRow>> {
     db.prepare(
-        "SELECT id, space_id, parent_id, position, icon, title, body, author_id, updated_at
+        "SELECT id, space_id, parent_id, position, icon, title, body, content_json, author_id, updated_at
          FROM articles
          WHERE company_id = ?1 AND id = ?2 AND deleted_at IS NULL",
     )
@@ -734,7 +780,7 @@ pub async fn list_articles(
         (Some(space_id), Some(match_query)) => {
             db.prepare(
                 "SELECT a.id, a.space_id, a.parent_id, a.position, a.icon, a.title, a.body,
-                        a.author_id, a.updated_at
+                        a.content_json, a.author_id, a.updated_at
                  FROM articles a
                  JOIN articles_fts ON articles_fts.rowid = a.rowid
                  WHERE a.company_id = ?1 AND a.space_id = ?2 AND a.deleted_at IS NULL
@@ -748,7 +794,8 @@ pub async fn list_articles(
         }
         (Some(space_id), None) => {
             db.prepare(
-                "SELECT id, space_id, parent_id, position, icon, title, body, author_id, updated_at
+                "SELECT id, space_id, parent_id, position, icon, title, body, content_json,
+                        author_id, updated_at
                  FROM articles
                  WHERE company_id = ?1 AND space_id = ?2 AND deleted_at IS NULL
                  ORDER BY position, updated_at DESC
@@ -761,7 +808,7 @@ pub async fn list_articles(
         (None, Some(match_query)) => {
             db.prepare(
                 "SELECT a.id, a.space_id, a.parent_id, a.position, a.icon, a.title, a.body,
-                        a.author_id, a.updated_at
+                        a.content_json, a.author_id, a.updated_at
                  FROM articles a
                  JOIN articles_fts ON articles_fts.rowid = a.rowid
                  WHERE a.company_id = ?1 AND a.deleted_at IS NULL AND articles_fts MATCH ?2
@@ -774,7 +821,8 @@ pub async fn list_articles(
         }
         (None, None) => {
             db.prepare(
-                "SELECT id, space_id, parent_id, position, icon, title, body, author_id, updated_at
+                "SELECT id, space_id, parent_id, position, icon, title, body, content_json,
+                        author_id, updated_at
                  FROM articles
                  WHERE company_id = ?1 AND deleted_at IS NULL
                  ORDER BY updated_at DESC
