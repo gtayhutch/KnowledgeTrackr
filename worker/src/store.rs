@@ -45,11 +45,38 @@ pub struct MembershipRow {
     pub role: String,
 }
 
-/// An article list row.
+/// A Space inside a company (ADR 0008).
+#[derive(Debug, Deserialize)]
+pub struct SpaceRow {
+    /// Space id.
+    pub id: String,
+    /// Owning company. Kept for callers that authorize against the row.
+    #[allow(dead_code)]
+    pub company_id: String,
+    /// Display name.
+    pub name: String,
+    /// URL slug unique inside the company.
+    pub slug: String,
+    /// Optional short description.
+    pub description: String,
+    /// Archive time, when set. Present for restore checks.
+    #[allow(dead_code)]
+    pub archived_at: Option<i64>,
+}
+
+/// A Page row. Stored in the `articles` table until a later rename migration.
 #[derive(Debug, Deserialize)]
 pub struct ArticleRow {
-    /// Article id.
+    /// Page id.
     pub id: String,
+    /// Space that owns the page.
+    pub space_id: String,
+    /// Parent page id, when nested.
+    pub parent_id: Option<String>,
+    /// Lexicographic order among siblings.
+    pub position: String,
+    /// Optional icon token.
+    pub icon: Option<String>,
     /// Title.
     pub title: String,
     /// Body.
@@ -380,12 +407,13 @@ pub async fn revoke_session(db: &D1Database, id: &str, now_ms: i64) -> Result<()
     Ok(())
 }
 
-/// Creates a company and an admin membership for `user_id`.
+/// Creates a company, an admin membership, and the default General Space.
 pub async fn create_company(
     db: &D1Database,
     company_id: &str,
     user_id: &str,
     name: &str,
+    space_id: &str,
     now_ms: i64,
 ) -> Result<()> {
     db.prepare("INSERT INTO companies (id, name, created_at) VALUES (?1, ?2, ?3)")
@@ -397,6 +425,109 @@ pub async fn create_company(
          VALUES (?1, ?2, 'admin', ?3)",
     )
     .bind(&[text(company_id), text(user_id), num(now_ms)])?
+    .run()
+    .await?;
+    insert_space(db, space_id, company_id, "General", "general", "", now_ms).await?;
+    Ok(())
+}
+
+/// Inserts a Space.
+pub async fn insert_space(
+    db: &D1Database,
+    id: &str,
+    company_id: &str,
+    name: &str,
+    slug: &str,
+    description: &str,
+    now_ms: i64,
+) -> Result<()> {
+    db.prepare(
+        "INSERT INTO spaces
+         (id, company_id, name, slug, description, created_at, archived_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
+    )
+    .bind(&[
+        text(id),
+        text(company_id),
+        text(name),
+        text(slug),
+        text(description),
+        num(now_ms),
+    ])?
+    .run()
+    .await?;
+    Ok(())
+}
+
+/// Lists active Spaces for a company.
+pub async fn list_spaces(db: &D1Database, company_id: &str) -> Result<Vec<SpaceRow>> {
+    let fetched = db
+        .prepare(
+            "SELECT id, company_id, name, slug, description, archived_at
+             FROM spaces
+             WHERE company_id = ?1 AND archived_at IS NULL
+             ORDER BY name",
+        )
+        .bind(&[text(company_id)])?
+        .all()
+        .await?;
+    fetched.results()
+}
+
+/// Loads one Space in a company.
+pub async fn get_space(
+    db: &D1Database,
+    company_id: &str,
+    space_id: &str,
+) -> Result<Option<SpaceRow>> {
+    db.prepare(
+        "SELECT id, company_id, name, slug, description, archived_at
+         FROM spaces
+         WHERE company_id = ?1 AND id = ?2",
+    )
+    .bind(&[text(company_id), text(space_id)])?
+    .first(None)
+    .await
+}
+
+/// Renames a Space.
+pub async fn rename_space(
+    db: &D1Database,
+    company_id: &str,
+    space_id: &str,
+    name: &str,
+) -> Result<()> {
+    db.prepare("UPDATE spaces SET name = ?1 WHERE company_id = ?2 AND id = ?3")
+        .bind(&[text(name), text(company_id), text(space_id)])?
+        .run()
+        .await?;
+    Ok(())
+}
+
+/// Archives a Space. Pages stay; the Space leaves the default list.
+pub async fn archive_space(
+    db: &D1Database,
+    company_id: &str,
+    space_id: &str,
+    now_ms: i64,
+) -> Result<()> {
+    db.prepare(
+        "UPDATE spaces SET archived_at = ?1
+         WHERE company_id = ?2 AND id = ?3 AND archived_at IS NULL",
+    )
+    .bind(&[num(now_ms), text(company_id), text(space_id)])?
+    .run()
+    .await?;
+    Ok(())
+}
+
+/// Restores an archived Space.
+pub async fn restore_space(db: &D1Database, company_id: &str, space_id: &str) -> Result<()> {
+    db.prepare(
+        "UPDATE spaces SET archived_at = NULL
+         WHERE company_id = ?1 AND id = ?2 AND archived_at IS NOT NULL",
+    )
+    .bind(&[text(company_id), text(space_id)])?
     .run()
     .await?;
     Ok(())
@@ -467,11 +598,15 @@ pub async fn insert_membership(
     Ok(())
 }
 
-/// Inserts an article. The FTS trigger indexes it.
+/// Inserts a Page. The FTS trigger indexes it.
+#[allow(clippy::too_many_arguments)]
 pub async fn insert_article(
     db: &D1Database,
     id: &str,
     company_id: &str,
+    space_id: &str,
+    parent_id: Option<&str>,
+    position: &str,
     title: &str,
     body: &str,
     author_id: &str,
@@ -479,12 +614,19 @@ pub async fn insert_article(
 ) -> Result<()> {
     db.prepare(
         "INSERT INTO articles
-         (id, company_id, title, body, author_id, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+         (id, company_id, space_id, parent_id, position, title, body, author_id,
+          created_at, updated_at, deleted_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, NULL)",
     )
     .bind(&[
         text(id),
         text(company_id),
+        text(space_id),
+        match parent_id {
+            Some(value) => text(value),
+            None => JsValue::NULL,
+        },
+        text(position),
         text(title),
         text(body),
         text(author_id),
@@ -495,7 +637,7 @@ pub async fn insert_article(
     Ok(())
 }
 
-/// Replaces an article's title and body.
+/// Replaces a Page's title and body.
 pub async fn update_article(
     db: &D1Database,
     id: &str,
@@ -506,7 +648,7 @@ pub async fn update_article(
 ) -> Result<()> {
     db.prepare(
         "UPDATE articles SET title = ?1, body = ?2, updated_at = ?3
-         WHERE id = ?4 AND company_id = ?5",
+         WHERE id = ?4 AND company_id = ?5 AND deleted_at IS NULL",
     )
     .bind(&[
         text(title),
@@ -520,58 +662,128 @@ pub async fn update_article(
     Ok(())
 }
 
-/// Deletes an article. Attachment rows are removed by the caller first.
-pub async fn delete_article(db: &D1Database, id: &str, company_id: &str) -> Result<()> {
-    db.prepare("DELETE FROM articles WHERE id = ?1 AND company_id = ?2")
-        .bind(&[text(id), text(company_id)])?
-        .run()
-        .await?;
+/// Moves a Page under a new parent and/or sibling order.
+pub async fn move_article(
+    db: &D1Database,
+    id: &str,
+    company_id: &str,
+    parent_id: Option<&str>,
+    position: &str,
+    now_ms: i64,
+) -> Result<()> {
+    db.prepare(
+        "UPDATE articles SET parent_id = ?1, position = ?2, updated_at = ?3
+         WHERE id = ?4 AND company_id = ?5 AND deleted_at IS NULL",
+    )
+    .bind(&[
+        match parent_id {
+            Some(value) => text(value),
+            None => JsValue::NULL,
+        },
+        text(position),
+        num(now_ms),
+        text(id),
+        text(company_id),
+    ])?
+    .run()
+    .await?;
     Ok(())
 }
 
-/// Loads one article in a company.
+/// Soft-deletes a Page. Attachment rows stay until hard cleanup.
+pub async fn delete_article(
+    db: &D1Database,
+    id: &str,
+    company_id: &str,
+    now_ms: i64,
+) -> Result<()> {
+    db.prepare(
+        "UPDATE articles SET deleted_at = ?1, updated_at = ?1
+         WHERE id = ?2 AND company_id = ?3 AND deleted_at IS NULL",
+    )
+    .bind(&[num(now_ms), text(id), text(company_id)])?
+    .run()
+    .await?;
+    Ok(())
+}
+
+/// Loads one Page in a company.
 pub async fn get_article(
     db: &D1Database,
     company_id: &str,
     article_id: &str,
 ) -> Result<Option<ArticleRow>> {
     db.prepare(
-        "SELECT id, title, body, author_id, updated_at FROM articles
-         WHERE company_id = ?1 AND id = ?2",
+        "SELECT id, space_id, parent_id, position, icon, title, body, author_id, updated_at
+         FROM articles
+         WHERE company_id = ?1 AND id = ?2 AND deleted_at IS NULL",
     )
     .bind(&[text(company_id), text(article_id)])?
     .first(None)
     .await
 }
 
-/// Lists articles, optionally restricted by an FTS5 MATCH string.
+/// Lists Pages in a company, optionally by Space and FTS5 MATCH.
 pub async fn list_articles(
     db: &D1Database,
     company_id: &str,
+    space_id: Option<&str>,
     fts: Option<&str>,
 ) -> Result<Vec<ArticleRow>> {
-    let fetched = if let Some(match_query) = fts {
-        db.prepare(
-            "SELECT a.id, a.title, a.body, a.author_id, a.updated_at
-             FROM articles a
-             JOIN articles_fts ON articles_fts.rowid = a.rowid
-             WHERE a.company_id = ?1 AND articles_fts MATCH ?2
-             ORDER BY a.updated_at DESC
-             LIMIT 50",
-        )
-        .bind(&[text(company_id), text(match_query)])?
-        .all()
-        .await?
-    } else {
-        db.prepare(
-            "SELECT id, title, body, author_id, updated_at FROM articles
-             WHERE company_id = ?1
-             ORDER BY updated_at DESC
-             LIMIT 50",
-        )
-        .bind(&[text(company_id)])?
-        .all()
-        .await?
+    let fetched = match (space_id, fts) {
+        (Some(space_id), Some(match_query)) => {
+            db.prepare(
+                "SELECT a.id, a.space_id, a.parent_id, a.position, a.icon, a.title, a.body,
+                        a.author_id, a.updated_at
+                 FROM articles a
+                 JOIN articles_fts ON articles_fts.rowid = a.rowid
+                 WHERE a.company_id = ?1 AND a.space_id = ?2 AND a.deleted_at IS NULL
+                   AND articles_fts MATCH ?3
+                 ORDER BY a.position, a.updated_at DESC
+                 LIMIT 200",
+            )
+            .bind(&[text(company_id), text(space_id), text(match_query)])?
+            .all()
+            .await?
+        }
+        (Some(space_id), None) => {
+            db.prepare(
+                "SELECT id, space_id, parent_id, position, icon, title, body, author_id, updated_at
+                 FROM articles
+                 WHERE company_id = ?1 AND space_id = ?2 AND deleted_at IS NULL
+                 ORDER BY position, updated_at DESC
+                 LIMIT 200",
+            )
+            .bind(&[text(company_id), text(space_id)])?
+            .all()
+            .await?
+        }
+        (None, Some(match_query)) => {
+            db.prepare(
+                "SELECT a.id, a.space_id, a.parent_id, a.position, a.icon, a.title, a.body,
+                        a.author_id, a.updated_at
+                 FROM articles a
+                 JOIN articles_fts ON articles_fts.rowid = a.rowid
+                 WHERE a.company_id = ?1 AND a.deleted_at IS NULL AND articles_fts MATCH ?2
+                 ORDER BY a.updated_at DESC
+                 LIMIT 50",
+            )
+            .bind(&[text(company_id), text(match_query)])?
+            .all()
+            .await?
+        }
+        (None, None) => {
+            db.prepare(
+                "SELECT id, space_id, parent_id, position, icon, title, body, author_id, updated_at
+                 FROM articles
+                 WHERE company_id = ?1 AND deleted_at IS NULL
+                 ORDER BY updated_at DESC
+                 LIMIT 50",
+            )
+            .bind(&[text(company_id)])?
+            .all()
+            .await?
+        }
     };
     fetched.results()
 }
@@ -668,7 +880,8 @@ pub async fn get_attachment(
     .await
 }
 
-/// Lists object keys for an article so the caller can delete the R2 objects.
+/// Lists object keys for hard cleanup of a soft-deleted page.
+#[allow(dead_code)]
 pub async fn list_attachment_keys(db: &D1Database, article_id: &str) -> Result<Vec<String>> {
     let fetched = db
         .prepare("SELECT object_key AS credential_id FROM attachments WHERE article_id = ?1")
@@ -679,7 +892,8 @@ pub async fn list_attachment_keys(db: &D1Database, article_id: &str) -> Result<V
     Ok(rows.into_iter().map(|row| row.credential_id).collect())
 }
 
-/// Deletes attachment rows for an article.
+/// Deletes attachment rows during hard cleanup of a soft-deleted page.
+#[allow(dead_code)]
 pub async fn delete_attachments(db: &D1Database, article_id: &str) -> Result<()> {
     db.prepare("DELETE FROM attachments WHERE article_id = ?1")
         .bind(&[text(article_id)])?

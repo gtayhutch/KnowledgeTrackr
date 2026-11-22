@@ -93,14 +93,45 @@ pub struct CompanyName {
     pub name: String,
 }
 
-/// Create or replace an article's text.
+/// Create or rename a Space.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct SpaceWrite {
+    /// Display name.
+    pub name: String,
+    /// Optional short description.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Optional slug. Generated from the name when omitted on create.
+    #[serde(default)]
+    pub slug: Option<String>,
+}
+
+/// Create or replace a Page's text.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ArticleWrite {
-    /// Article title.
+    /// Page title.
     pub title: String,
-    /// Article body, markdown or plain text.
+    /// Page body, markdown or plain text.
     pub body: String,
+    /// Space that owns a new page. Required on create; ignored on update.
+    #[serde(default)]
+    pub space_id: Option<String>,
+    /// Parent page for a new nested page.
+    #[serde(default)]
+    pub parent_id: Option<String>,
+}
+
+/// Reparent or reorder a Page inside its Space.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ArticleMove {
+    /// New parent page, or omit/null for a root page.
+    #[serde(default)]
+    pub parent_id: Option<String>,
+    /// Lexicographic order among siblings.
+    pub position: String,
 }
 
 /// Checks an email address shape without promising the mailbox exists.
@@ -152,16 +183,87 @@ pub fn require_label(field: &'static str, name: &str, max: usize) -> Result<Stri
     Ok(name.to_string())
 }
 
-/// Checks article text lengths.
+/// Checks or builds a Space slug.
+pub fn require_slug(field: &'static str, slug: &str) -> Result<String, InvalidInput> {
+    let slug = slug.trim().to_lowercase();
+    if slug.is_empty() || slug.len() > 80 {
+        return Err(InvalidInput {
+            field,
+            message: "Use a shorter slug.",
+        });
+    }
+    if !slug
+        .chars()
+        .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')
+        || slug.starts_with('-')
+        || slug.ends_with('-')
+        || slug.contains("--")
+    {
+        return Err(InvalidInput {
+            field,
+            message: "Use lowercase letters, numbers, and single hyphens.",
+        });
+    }
+    Ok(slug)
+}
+
+/// Builds a slug from a Space name.
+pub fn slug_from_name(name: &str) -> String {
+    let mut out = String::new();
+    let mut pending_hyphen = false;
+    for ch in name.trim().chars() {
+        if ch.is_ascii_alphanumeric() {
+            if pending_hyphen && !out.is_empty() {
+                out.push('-');
+            }
+            pending_hyphen = false;
+            out.push(ch.to_ascii_lowercase());
+        } else if !out.is_empty() {
+            pending_hyphen = true;
+        }
+    }
+    if out.is_empty() {
+        out.push_str("space");
+    }
+    out.truncate(80);
+    out.trim_matches('-').to_string()
+}
+
+/// Checks page text lengths.
 pub fn require_article(title: &str, body: &str) -> Result<(String, String), InvalidInput> {
     let title = require_label("title", title, 200)?;
     if body.chars().count() > 100_000 {
         return Err(InvalidInput {
             field: "body",
-            message: "The article is too long.",
+            message: "The page is too long.",
         });
     }
     Ok((title, body.to_string()))
+}
+
+/// Checks a Space description.
+pub fn require_description(description: &str) -> Result<String, InvalidInput> {
+    let description = description.trim();
+    if description.chars().count() > 500 {
+        return Err(InvalidInput {
+            field: "description",
+            message: "Use a shorter description.",
+        });
+    }
+    Ok(description.to_string())
+}
+
+/// Checks a move position token.
+pub fn require_position(position: &str) -> Result<String, InvalidInput> {
+    let position = position.trim();
+    let len = position.chars().count();
+    if !(1..=64).contains(&len) {
+        return Err(InvalidInput {
+            field: "position",
+            message: "Use a shorter position.",
+        });
+    }
+    Ok(position.to_string())
 }
 
 /// Checks an upload before it is written to R2.
@@ -222,6 +324,13 @@ mod tests {
             r#"{"title":"Hello","body":"Text","companyId":"other"}"#,
         );
         assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn slug_from_name_lowercases_and_hyphenates() {
+        assert_eq!(slug_from_name("  Eng Docs! "), "eng-docs");
+        assert_eq!(require_slug("slug", "eng-docs").unwrap(), "eng-docs");
+        assert!(require_slug("slug", "Eng Docs").is_err());
     }
 
     #[test]
