@@ -1,12 +1,18 @@
-import { useEffect, useState, type FormEvent } from "react";
-import { api, ApiError, uploadFile } from "./api";
-import { Button, Input, Label, QuietButton, TextArea } from "./components";
+import { lazy, Suspense, useEffect, useState, type FormEvent } from "react";
+import { api, ApiError } from "./api";
+import { Button, Input, Label, QuietButton } from "./components";
 import {
   createPasskey,
   getPasskey,
   type CreationOptions,
   type RequestOptions,
 } from "./passkey";
+
+const PageEditor = lazy(() =>
+  import("./editor/PageEditor").then((module) => ({
+    default: module.PageEditor,
+  })),
+);
 
 type Session = {
   user: { id: string; email: string; displayName: string };
@@ -27,16 +33,8 @@ type Article = {
   position: string;
   icon: string | null;
   title: string;
-  body: string;
   authorId: string;
   updatedAt: number;
-};
-
-type Attachment = {
-  id: string;
-  fileName: string;
-  contentType: string;
-  byteSize: number;
 };
 
 type Route =
@@ -421,10 +419,7 @@ function Library({
   const [query, setQuery] = useState("");
   const [spaces, setSpaces] = useState<Space[]>([]);
   const [articles, setArticles] = useState<Article[]>([]);
-  const [title, setTitle] = useState("");
-  const [body, setBody] = useState("");
   const [parentId, setParentId] = useState<string | null>(null);
-  const [files, setFiles] = useState<Attachment[]>([]);
   const [message, setMessage] = useState<string | null>(null);
   const [draggingId, setDraggingId] = useState<string | null>(null);
 
@@ -454,26 +449,6 @@ function Library({
       .then(setArticles)
       .catch((error: unknown) => setMessage(messageOf(error)));
   }, [activeCompanyId, activeSpaceId, query]);
-
-  useEffect(() => {
-    if (!activeCompanyId || !articleId) {
-      setTitle("");
-      setBody("");
-      setParentId(null);
-      setFiles([]);
-      return;
-    }
-    void api<Article>(
-      `/api/companies/${activeCompanyId}/articles/${articleId}`,
-    ).then((article) => {
-      setTitle(article.title);
-      setBody(article.body);
-      setParentId(article.parentId);
-    });
-    void api<Attachment[]>(
-      `/api/companies/${activeCompanyId}/articles/${articleId}/attachments`,
-    ).then(setFiles);
-  }, [articleId, activeCompanyId]);
 
   async function createCompany(event: FormEvent) {
     event.preventDefault();
@@ -518,37 +493,6 @@ function Library({
     setArticles(await api<Article[]>(path));
   }
 
-  async function saveArticle(event: FormEvent) {
-    event.preventDefault();
-    if (!activeSpaceId) return;
-    setMessage(null);
-    try {
-      if (articleId) {
-        await api(`/api/companies/${activeCompanyId}/articles/${articleId}`, {
-          method: "PUT",
-          body: JSON.stringify({ title, body }),
-        });
-      } else {
-        const created = await api<{ id: string }>(
-          `/api/companies/${activeCompanyId}/articles`,
-          {
-            method: "POST",
-            body: JSON.stringify({
-              title,
-              body,
-              spaceId: activeSpaceId,
-              parentId,
-            }),
-          },
-        );
-        location.hash = `#/app/${activeCompanyId}/${activeSpaceId}/${created.id}`;
-      }
-      await refreshPages();
-    } catch (error) {
-      setMessage(messageOf(error));
-    }
-  }
-
   async function createSpace(event: FormEvent) {
     event.preventDefault();
     setMessage(null);
@@ -566,21 +510,6 @@ function Library({
       );
       setSpaces(next);
       location.hash = `#/app/${activeCompanyId}/${created.id}`;
-    } catch (error) {
-      setMessage(messageOf(error));
-    }
-  }
-
-  async function onUpload(file: File | undefined) {
-    if (!file || !articleId) return;
-    setMessage(null);
-    try {
-      await uploadFile(activeCompanyId, articleId, file);
-      setFiles(
-        await api<Attachment[]>(
-          `/api/companies/${activeCompanyId}/articles/${articleId}/attachments`,
-        ),
-      );
     } catch (error) {
       setMessage(messageOf(error));
     }
@@ -776,12 +705,9 @@ function Library({
             ) : null}
             {message ? <p className="mt-3 text-sm">{message}</p> : null}
           </div>
-        ) : (
-          <form onSubmit={(event) => void saveArticle(event)}>
-            <h1 className="mb-4 text-3xl">
-              {articleId ? "Edit page" : "New page"}
-            </h1>
-            {!articleId ? (
+        ) : activeSpaceId ? (
+          <div>
+            {composing ? (
               <div className="mb-4">
                 <Label htmlFor="parentId">Parent page</Label>
                 <select
@@ -799,46 +725,21 @@ function Library({
                 </select>
               </div>
             ) : null}
-            <Label htmlFor="title">Title</Label>
-            <Input
-              id="title"
-              value={title}
-              onChange={(event) => setTitle(event.target.value)}
-              required
-            />
-            <div className="mt-4">
-              <Label htmlFor="body">Body</Label>
-              <TextArea
-                id="body"
-                value={body}
-                onChange={(event) => setBody(event.target.value)}
+            {message ? <p className="mb-3 text-sm">{message}</p> : null}
+            <Suspense fallback={<p className="text-sm">Loading editor…</p>}>
+              <PageEditor
+                companyId={activeCompanyId}
+                spaceId={activeSpaceId}
+                pageId={articleId}
+                parentId={parentId}
+                composing={composing}
+                onMessage={setMessage}
+                onCreated={(id) => {
+                  void refreshPages();
+                  location.hash = `#/app/${activeCompanyId}/${activeSpaceId}/${id}`;
+                }}
               />
-            </div>
-            {message ? <p className="mt-3 text-sm">{message}</p> : null}
-            <Button className="mt-4" type="submit">
-              Save
-            </Button>
-          </form>
-        )}
-        {articleId ? (
-          <div className="mt-8">
-            <h2 className="mb-2 text-xl">Files</h2>
-            <ul className="mb-3 text-sm">
-              {files.map((file) => (
-                <li key={file.id}>
-                  <a
-                    href={`/api/companies/${activeCompanyId}/attachments/${file.id}`}
-                  >
-                    {file.fileName}
-                  </a>
-                </li>
-              ))}
-            </ul>
-            <input
-              type="file"
-              aria-label="Upload a file"
-              onChange={(event) => void onUpload(event.target.files?.[0])}
-            />
+            </Suspense>
           </div>
         ) : null}
       </section>

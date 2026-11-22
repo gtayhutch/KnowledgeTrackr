@@ -24,3 +24,101 @@ h2 {
   font-family: var(--font-serif);
   font-weight: 500;
 }
+
+.kt-editor .ProseMirror {
+  min-height: 16rem;
+  padding: 1rem;
+  border: 1px solid var(--color-rule);
+  border-radius: 0.375rem;
+  background: white;
+  outline: none;
+}
+
+.kt-editor .ProseMirror p {
+  margin: 0.5rem 0;
+}
+
+.kt-editor .ProseMirror h2 {
+  margin: 1rem 0 0.5rem;
+  font-size: 1.5rem;
+}
+
+.kt-editor .ProseMirror ul {
+  padding-left: 1.25rem;
+  list-style: disc;
+}
+
+.kt-editor .ProseMirror table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.kt-editor .ProseMirror th,
+.kt-editor .ProseMirror td {
+  border: 1px solid var(--color-rule);
+  padding: 0.35rem 0.5rem;
+}
+
+.kt-callout {
+  margin: 0.75rem 0;
+  padding: 0.75rem 1rem;
+  border-left: 3px solid var(--color-pine);
+  background: #ebe4d8;
+}
+
+.kt-mention {
+  border-radius: 0.25rem;
+  background: #e4eee8;
+  padding: 0 0.2rem;
+  color: var(--color-pine);
+}
+
+.kt-mention-list {
+  min-width: 12rem;
+  overflow: hidden;
+  border: 1px solid var(--color-rule);
+  border-radius: 0.375rem;
+  background: white;
+  box-shadow: 0 8px 24px rgb(28 25 21 / 12%);
+}
+
+.kt-mention-list button {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.5rem 0.75rem;
+  border: 0;
+  background: transparent;
+  text-align: left;
+  font: inherit;
+  cursor: pointer;
+}
+
+.kt-mention-list button.is-active,
+.kt-mention-list button:hover {
+  background: #ebe4d8;
+}
+
+.kt-mention-kind {
+  font-size: 0.75rem;
+  color: #6b645a;
+}
+
+.kt-embed iframe {
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  border: 0;
+  border-radius: 0.375rem;
+}
+
+.kt-image {
+  max-width: 100%;
+  height: auto;
+}
+
+.kt-link {
+  color: var(--color-pine);
+  text-decoration: underline;
+}
